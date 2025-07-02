@@ -6,7 +6,6 @@ from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers.request_handler import RequestHandler
 from a2a.server.request_handlers.response_helpers import prepare_response_object
 from a2a.types import (
-    AgentCard,
     CancelTaskRequest,
     CancelTaskResponse,
     CancelTaskSuccessResponse,
@@ -42,7 +41,6 @@ from a2a.types import (
     TaskStatusUpdateEvent,
 )
 from a2a.utils.errors import ServerError
-from a2a.utils.helpers import validate
 from a2a.utils.telemetry import SpanKind, trace_class
 
 
@@ -55,16 +53,13 @@ class JSONRPCHandler:
 
     def __init__(
         self,
-        agent_card: AgentCard,
         request_handler: RequestHandler,
     ):
         """Initializes the JSONRPCHandler.
 
         Args:
-            agent_card: The AgentCard describing the agent's capabilities.
             request_handler: The underlying `RequestHandler` instance to delegate requests to.
         """
-        self.agent_card = agent_card
         self.request_handler = request_handler
 
     async def on_message_send(
@@ -101,10 +96,6 @@ class JSONRPCHandler:
                 )
             )
 
-    @validate(
-        lambda self: self.agent_card.capabilities.streaming,
-        'Streaming is not supported by the agent',
-    )
     async def on_message_send_stream(
         self,
         request: SendStreamingMessageRequest,
@@ -254,10 +245,6 @@ class JSONRPCHandler:
                 )
             )
 
-    @validate(
-        lambda self: self.agent_card.capabilities.pushNotifications,
-        'Push notifications are not supported by the agent',
-    )
     async def set_push_notification_config(
         self,
         request: SetTaskPushNotificationConfigRequest,

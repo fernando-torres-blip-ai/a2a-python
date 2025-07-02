@@ -5,6 +5,7 @@ from typing import Any
 from starlette.applications import Starlette
 from starlette.routing import Route
 
+from a2a.server.agent_card.agent_card_handler import AgentCardHandler
 from a2a.server.apps.jsonrpc.jsonrpc_app import (
     CallContextBuilder,
     JSONRPCApplication,
@@ -26,7 +27,7 @@ class A2AStarletteApplication(JSONRPCApplication):
 
     def __init__(
         self,
-        agent_card: AgentCard,
+        agent_card_handler: AgentCardHandler,
         http_handler: RequestHandler,
         extended_agent_card: AgentCard | None = None,
         context_builder: CallContextBuilder | None = None,
@@ -34,7 +35,7 @@ class A2AStarletteApplication(JSONRPCApplication):
         """Initializes the A2AStarletteApplication.
 
         Args:
-            agent_card: The AgentCard describing the agent's capabilities.
+            agent_card_handler: The AgentCardHandler to fetch agent's card.
             http_handler: The handler instance responsible for processing A2A
               requests via http.
             extended_agent_card: An optional, distinct AgentCard to be served
@@ -44,7 +45,7 @@ class A2AStarletteApplication(JSONRPCApplication):
               ServerCallContext is passed.
         """
         super().__init__(
-            agent_card=agent_card,
+            agent_card_handler=agent_card_handler,
             http_handler=http_handler,
             extended_agent_card=extended_agent_card,
             context_builder=context_builder,
@@ -79,17 +80,14 @@ class A2AStarletteApplication(JSONRPCApplication):
                 methods=['GET'],
                 name='agent_card',
             ),
+            Route(
+                extended_agent_card_url,
+                self._handle_get_authenticated_extended_agent_card,
+                methods=['GET'],
+                name='authenticated_extended_agent_card',
+            )
         ]
 
-        if self.agent_card.supportsAuthenticatedExtendedCard:
-            app_routes.append(
-                Route(
-                    extended_agent_card_url,
-                    self._handle_get_authenticated_extended_agent_card,
-                    methods=['GET'],
-                    name='authenticated_extended_agent_card',
-                )
-            )
         return app_routes
 
     def add_routes_to_app(

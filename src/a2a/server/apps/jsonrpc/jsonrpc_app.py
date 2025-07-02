@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, Response
 
 from a2a.auth.user import UnauthenticatedUser
 from a2a.auth.user import User as A2AUser
+from a2a.server.agent_card.agent_card_handler import AgentCardHandler
 from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers.jsonrpc_handler import JSONRPCHandler
 from a2a.server.request_handlers.request_handler import RequestHandler
@@ -42,7 +43,7 @@ from a2a.types import (
     TaskResubscriptionRequest,
     UnsupportedOperationError,
 )
-from a2a.utils.errors import MethodNotImplementedError
+from a2a.utils.errors import MethodNotImplementedError, ServerError
 
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ class JSONRPCApplication(ABC):
 
     def __init__(
         self,
-        agent_card: AgentCard,
+        agent_card_handler: AgentCardHandler,
         http_handler: RequestHandler,
         extended_agent_card: AgentCard | None = None,
         context_builder: CallContextBuilder | None = None,
@@ -113,7 +114,7 @@ class JSONRPCApplication(ABC):
         """Initializes the A2AStarletteApplication.
 
         Args:
-            agent_card: The AgentCard describing the agent's capabilities.
+            agent_card_handler: The AgentCardHandler to fetch agent's card.
             http_handler: The handler instance responsible for processing A2A
               requests via http.
             extended_agent_card: An optional, distinct AgentCard to be served
@@ -122,18 +123,8 @@ class JSONRPCApplication(ABC):
               ServerCallContext passed to the http_handler. If None, no
               ServerCallContext is passed.
         """
-        self.agent_card = agent_card
-        self.extended_agent_card = extended_agent_card
-        self.handler = JSONRPCHandler(
-            agent_card=agent_card, request_handler=http_handler
-        )
-        if (
-            self.agent_card.supportsAuthenticatedExtendedCard
-            and self.extended_agent_card is None
-        ):
-            logger.error(
-                'AgentCard.supportsAuthenticatedExtendedCard is True, but no extended_agent_card was provided. The /agent/authenticatedExtendedCard endpoint will return 404.'
-            )
+        self.agent_card_handler = agent_card_handler
+        self.handler = JSONRPCHandler(request_handler=http_handler)
         self._context_builder = context_builder or DefaultCallContextBuilder()
 
     def _generate_error_response(
@@ -194,6 +185,7 @@ class JSONRPCApplication(ABC):
         body = None
 
         try:
+            agent_card = await self.agent_card_handler.get_agent_card(request)
             body = await request.json()
             a2a_request = A2ARequest.model_validate(body)
             call_context = self._context_builder.build(request)
@@ -206,11 +198,11 @@ class JSONRPCApplication(ABC):
                 TaskResubscriptionRequest | SendStreamingMessageRequest,
             ):
                 return await self._process_streaming_request(
-                    request_id, a2a_request, call_context
+                    request_id, agent_card, a2a_request, call_context
                 )
 
             return await self._process_non_streaming_request(
-                request_id, a2a_request, call_context
+                request_id, agent_card, a2a_request, call_context
             )
         except MethodNotImplementedError:
             traceback.print_exc()
@@ -238,6 +230,7 @@ class JSONRPCApplication(ABC):
     async def _process_streaming_request(
         self,
         request_id: str | int | None,
+        agent_card: AgentCard,
         a2a_request: A2ARequest,
         context: ServerCallContext,
     ) -> Response:
@@ -245,12 +238,18 @@ class JSONRPCApplication(ABC):
 
         Args:
             request_id: The ID of the request.
+            agent_card: The AgentCard describing the agent's capabilities.
             a2a_request: The validated A2ARequest object.
             context: The ServerCallContext for the request.
 
         Returns:
             An `EventSourceResponse` object to stream results to the client.
         """
+        if not agent_card.capabilities.streaming:
+            final_message = 'Streaming is not supported by the agent'
+            logger.error(f'Unsupported Operation: {final_message}')
+            raise ServerError(UnsupportedOperationError(message=final_message))
+
         request_obj = a2a_request.root
         handler_result: Any = None
         if isinstance(
@@ -270,6 +269,7 @@ class JSONRPCApplication(ABC):
     async def _process_non_streaming_request(
         self,
         request_id: str | int | None,
+        agent_card: AgentCard,
         a2a_request: A2ARequest,
         context: ServerCallContext,
     ) -> Response:
@@ -277,6 +277,7 @@ class JSONRPCApplication(ABC):
 
         Args:
             request_id: The ID of the request.
+            agent_card: The AgentCard describing the agent's capabilities.
             a2a_request: The validated A2ARequest object.
             context: The ServerCallContext for the request.
 
@@ -299,6 +300,12 @@ class JSONRPCApplication(ABC):
                     request_obj, context
                 )
             case SetTaskPushNotificationConfigRequest():
+                if not agent_card.capabilities.pushNotifications:
+                    final_message = 'Push notifications are not supported by the agent'
+                    logger.error(f'Unsupported Operation: {final_message}')
+                    raise ServerError(
+                        UnsupportedOperationError(message=final_message)
+                    )
                 handler_result = await self.handler.set_push_notification_config(
                     request_obj,
                     context,
@@ -332,12 +339,12 @@ class JSONRPCApplication(ABC):
         return self._create_response(handler_result)
 
     def _create_response(
-        self,
-        handler_result: (
-            AsyncGenerator[SendStreamingMessageResponse]
-            | JSONRPCErrorResponse
-            | JSONRPCResponse
-        ),
+            self,
+            handler_result: (
+                    AsyncGenerator[SendStreamingMessageResponse]
+                    | JSONRPCErrorResponse
+                    | JSONRPCResponse
+            ),
     ) -> Response:
         """Creates a Starlette Response based on the result from the request handler.
 
@@ -357,7 +364,7 @@ class JSONRPCApplication(ABC):
         if isinstance(handler_result, AsyncGenerator):
             # Result is a stream of SendStreamingMessageResponse objects
             async def event_generator(
-                stream: AsyncGenerator[SendStreamingMessageResponse],
+                    stream: AsyncGenerator[SendStreamingMessageResponse],
             ) -> AsyncGenerator[dict[str, str]]:
                 async for item in stream:
                     yield {'data': item.root.model_dump_json(exclude_none=True)}
@@ -386,27 +393,30 @@ class JSONRPCApplication(ABC):
         """
         # The public agent card is a direct serialization of the agent_card
         # provided at initialization.
+        agent_card = await self.agent_card_handler.get_agent_card(request)
         return JSONResponse(
-            self.agent_card.model_dump(
+            agent_card.model_dump(
                 exclude_none=True,
                 by_alias=True,
             )
         )
 
     async def _handle_get_authenticated_extended_agent_card(
-        self, request: Request
+            self, request: Request
     ) -> JSONResponse:
         """Handles GET requests for the authenticated extended agent card."""
-        if not self.agent_card.supportsAuthenticatedExtendedCard:
+        agent_card = await self.agent_card_handler.get_agent_card(request)
+        if not agent_card.supportsAuthenticatedExtendedCard:
             return JSONResponse(
                 {'error': 'Extended agent card not supported or not enabled.'},
                 status_code=404,
             )
 
         # If an explicit extended_agent_card is provided, serve that.
-        if self.extended_agent_card:
+        extended_agent_card = await self.agent_card_handler.get_authenticated_extended_agent_car(request)
+        if extended_agent_card:
             return JSONResponse(
-                self.extended_agent_card.model_dump(
+                extended_agent_card.model_dump(
                     exclude_none=True,
                     by_alias=True,
                 )
@@ -423,10 +433,10 @@ class JSONRPCApplication(ABC):
 
     @abstractmethod
     def build(
-        self,
-        agent_card_url: str = '/.well-known/agent.json',
-        rpc_url: str = '/',
-        **kwargs: Any,
+            self,
+            agent_card_url: str = '/.well-known/agent.json',
+            rpc_url: str = '/',
+            **kwargs: Any,
     ) -> FastAPI | Starlette:
         """Builds and returns the JSONRPC application instance.
 
