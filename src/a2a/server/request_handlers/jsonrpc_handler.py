@@ -1,18 +1,22 @@
 import logging
 
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
 
 from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers.request_handler import RequestHandler
 from a2a.server.request_handlers.response_helpers import prepare_response_object
 from a2a.types import (
     AgentCard,
+    AuthenticatedExtendedCardNotConfiguredError,
     CancelTaskRequest,
     CancelTaskResponse,
     CancelTaskSuccessResponse,
     DeleteTaskPushNotificationConfigRequest,
     DeleteTaskPushNotificationConfigResponse,
     DeleteTaskPushNotificationConfigSuccessResponse,
+    GetAuthenticatedExtendedCardRequest,
+    GetAuthenticatedExtendedCardResponse,
+    GetAuthenticatedExtendedCardSuccessResponse,
     GetTaskPushNotificationConfigRequest,
     GetTaskPushNotificationConfigResponse,
     GetTaskPushNotificationConfigSuccessResponse,
@@ -57,15 +61,26 @@ class JSONRPCHandler:
         self,
         agent_card: AgentCard,
         request_handler: RequestHandler,
+        extended_agent_card: AgentCard | None = None,
+        extended_card_modifier: Callable[
+            [AgentCard, ServerCallContext], AgentCard
+        ]
+        | None = None,
     ):
         """Initializes the JSONRPCHandler.
 
         Args:
             agent_card: The AgentCard describing the agent's capabilities.
             request_handler: The underlying `RequestHandler` instance to delegate requests to.
+            extended_agent_card: An optional, distinct Extended AgentCard to be served
+            extended_card_modifier: An optional callback to dynamically modify
+              the extended agent card before it is served. It receives the
+              call context.
         """
         self.agent_card = agent_card
         self.request_handler = request_handler
+        self.extended_agent_card = extended_agent_card
+        self.extended_card_modifier = extended_card_modifier
 
     async def on_message_send(
         self,
@@ -172,7 +187,7 @@ class JSONRPCHandler:
                     CancelTaskSuccessResponse,
                     CancelTaskResponse,
                 )
-            raise ServerError(error=TaskNotFoundError())
+            raise ServerError(error=TaskNotFoundError())  # noqa: TRY301
         except ServerError as e:
             return CancelTaskResponse(
                 root=JSONRPCErrorResponse(
@@ -255,7 +270,7 @@ class JSONRPCHandler:
             )
 
     @validate(
-        lambda self: self.agent_card.capabilities.pushNotifications,
+        lambda self: self.agent_card.capabilities.push_notifications,
         'Push notifications are not supported by the agent',
     )
     async def set_push_notification_config(
@@ -324,7 +339,7 @@ class JSONRPCHandler:
                     GetTaskSuccessResponse,
                     GetTaskResponse,
                 )
-            raise ServerError(error=TaskNotFoundError())
+            raise ServerError(error=TaskNotFoundError())  # noqa: TRY301
         except ServerError as e:
             return GetTaskResponse(
                 root=JSONRPCErrorResponse(
@@ -347,10 +362,8 @@ class JSONRPCHandler:
             A `ListTaskPushNotificationConfigResponse` object containing the config or a JSON-RPC error.
         """
         try:
-            config = (
-                await self.request_handler.on_list_task_push_notification_config(
-                    request.params, context
-                )
+            config = await self.request_handler.on_list_task_push_notification_config(
+                request.params, context
             )
             return prepare_response_object(
                 request.id,
@@ -397,3 +410,42 @@ class JSONRPCHandler:
                     id=request.id, error=e.error if e.error else InternalError()
                 )
             )
+
+    async def get_authenticated_extended_card(
+        self,
+        request: GetAuthenticatedExtendedCardRequest,
+        context: ServerCallContext | None = None,
+    ) -> GetAuthenticatedExtendedCardResponse:
+        """Handles the 'agent/authenticatedExtendedCard' JSON-RPC method.
+
+        Args:
+            request: The incoming `GetAuthenticatedExtendedCardRequest` object.
+            context: Context provided by the server.
+
+        Returns:
+            A `GetAuthenticatedExtendedCardResponse` object containing the config or a JSON-RPC error.
+        """
+        if (
+            self.extended_agent_card is None
+            and self.extended_card_modifier is None
+        ):
+            return GetAuthenticatedExtendedCardResponse(
+                root=JSONRPCErrorResponse(
+                    id=request.id,
+                    error=AuthenticatedExtendedCardNotConfiguredError(),
+                )
+            )
+
+        base_card = self.extended_agent_card
+        if base_card is None:
+            base_card = self.agent_card
+
+        card_to_serve = base_card
+        if self.extended_card_modifier and context:
+            card_to_serve = self.extended_card_modifier(base_card, context)
+
+        return GetAuthenticatedExtendedCardResponse(
+            root=GetAuthenticatedExtendedCardSuccessResponse(
+                id=request.id, result=card_to_serve
+            )
+        )

@@ -49,6 +49,7 @@ class TaskUpdater:
         message: Message | None = None,
         final: bool = False,
         timestamp: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Updates the status of the task and publishes a `TaskStatusUpdateEvent`.
 
@@ -57,20 +58,28 @@ class TaskUpdater:
             message: An optional message associated with the status update.
             final: If True, indicates this is the final status update for the task.
             timestamp: Optional ISO 8601 datetime string. Defaults to current time.
+            metadata: Optional metadata for extensions.
         """
         async with self._lock:
             if self._terminal_state_reached:
-                raise RuntimeError(f"Task {self.task_id} is already in a terminal state.")
+                raise RuntimeError(
+                    f'Task {self.task_id} is already in a terminal state.'
+                )
             if state in self._terminal_states:
                 self._terminal_state_reached = True
                 final = True
 
-            current_timestamp = timestamp if timestamp else datetime.now(timezone.utc).isoformat()
+            current_timestamp = (
+                timestamp
+                if timestamp
+                else datetime.now(timezone.utc).isoformat()
+            )
             await self.event_queue.enqueue_event(
                 TaskStatusUpdateEvent(
-                    taskId=self.task_id,
-                    contextId=self.context_id,
+                    task_id=self.task_id,
+                    context_id=self.context_id,
                     final=final,
+                    metadata=metadata,
                     status=TaskStatus(
                         state=state,
                         message=message,
@@ -87,6 +96,7 @@ class TaskUpdater:
         metadata: dict[str, Any] | None = None,
         append: bool | None = None,
         last_chunk: bool | None = None,
+        extensions: list[str] | None = None,
     ) -> None:
         """Adds an artifact chunk to the task and publishes a `TaskArtifactUpdateEvent`.
 
@@ -97,22 +107,24 @@ class TaskUpdater:
             metadata: Optional metadata for the artifact.
             append: Optional boolean indicating if this chunk appends to a previous one.
             last_chunk: Optional boolean indicating if this is the last chunk.
+            extensions: Optional list of extensions for the artifact.
         """
         if not artifact_id:
             artifact_id = str(uuid.uuid4())
 
         await self.event_queue.enqueue_event(
             TaskArtifactUpdateEvent(
-                taskId=self.task_id,
-                contextId=self.context_id,
+                task_id=self.task_id,
+                context_id=self.context_id,
                 artifact=Artifact(
-                    artifactId=artifact_id,
+                    artifact_id=artifact_id,
                     name=name,
                     parts=parts,
                     metadata=metadata,
+                    extensions=extensions,
                 ),
                 append=append,
-                lastChunk=last_chunk
+                last_chunk=last_chunk,
             )
         )
 
@@ -191,9 +203,9 @@ class TaskUpdater:
         """
         return Message(
             role=Role.agent,
-            taskId=self.task_id,
-            contextId=self.context_id,
-            messageId=str(uuid.uuid4()),
+            task_id=self.task_id,
+            context_id=self.context_id,
+            message_id=str(uuid.uuid4()),
             metadata=metadata,
             parts=parts,
         )

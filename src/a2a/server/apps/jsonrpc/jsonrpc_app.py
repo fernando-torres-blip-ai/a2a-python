@@ -4,21 +4,17 @@ import logging
 import traceback
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
-from typing import Any
+from collections.abc import AsyncGenerator, Callable
+from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI
 from pydantic import ValidationError
-from sse_starlette.sse import EventSourceResponse
-from starlette.applications import Starlette
-from starlette.authentication import BaseUser
-from starlette.exceptions import HTTPException
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.status import HTTP_413_REQUEST_ENTITY_TOO_LARGE
 
 from a2a.auth.user import UnauthenticatedUser
 from a2a.auth.user import User as A2AUser
+from a2a.extensions.common import (
+    HTTP_EXTENSION_HEADER,
+    get_requested_extensions,
+)
 from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers.jsonrpc_handler import JSONRPCHandler
 from a2a.server.request_handlers.request_handler import RequestHandler
@@ -28,15 +24,19 @@ from a2a.types import (
     AgentCard,
     CancelTaskRequest,
     DeleteTaskPushNotificationConfigRequest,
+    GetAuthenticatedExtendedCardRequest,
     GetTaskPushNotificationConfigRequest,
     GetTaskRequest,
     InternalError,
+    InvalidParamsError,
     InvalidRequestError,
     JSONParseError,
     JSONRPCError,
     JSONRPCErrorResponse,
+    JSONRPCRequest,
     JSONRPCResponse,
     ListTaskPushNotificationConfigRequest,
+    MethodNotFoundError,
     SendMessageRequest,
     SendStreamingMessageRequest,
     SendStreamingMessageResponse,
@@ -48,11 +48,50 @@ from a2a.utils.constants import (
     AGENT_CARD_WELL_KNOWN_PATH,
     DEFAULT_RPC_URL,
     EXTENDED_AGENT_CARD_PATH,
+    PREV_AGENT_CARD_WELL_KNOWN_PATH,
 )
 from a2a.utils.errors import MethodNotImplementedError
 
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+    from sse_starlette.sse import EventSourceResponse
+    from starlette.applications import Starlette
+    from starlette.authentication import BaseUser
+    from starlette.exceptions import HTTPException
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
+    from starlette.status import HTTP_413_REQUEST_ENTITY_TOO_LARGE
+
+    _package_starlette_installed = True
+else:
+    FastAPI = Any
+    try:
+        from sse_starlette.sse import EventSourceResponse
+        from starlette.applications import Starlette
+        from starlette.authentication import BaseUser
+        from starlette.exceptions import HTTPException
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, Response
+        from starlette.status import HTTP_413_REQUEST_ENTITY_TOO_LARGE
+
+        _package_starlette_installed = True
+    except ImportError:
+        _package_starlette_installed = False
+        # Provide placeholder types for runtime type hinting when dependencies are not installed.
+        # These will not be used if the code path that needs them is guarded by _http_server_installed.
+        EventSourceResponse = Any
+        Starlette = Any
+        BaseUser = Any
+        HTTPException = Any
+        Request = Any
+        JSONResponse = Any
+        Response = Any
+        HTTP_413_REQUEST_ENTITY_TOO_LARGE = Any
+
+MAX_CONTENT_LENGTH = 1_000_000
 
 
 class StarletteUserProxy(A2AUser):
@@ -99,7 +138,13 @@ class DefaultCallContextBuilder(CallContextBuilder):
             user = StarletteUserProxy(request.user)
             state['auth'] = request.auth
         state['headers'] = dict(request.headers)
-        return ServerCallContext(user=user, state=state)
+        return ServerCallContext(
+            user=user,
+            state=state,
+            requested_extensions=get_requested_extensions(
+                request.headers.getlist(HTTP_EXTENSION_HEADER)
+            ),
+        )
 
 
 class JSONRPCApplication(ABC):
@@ -110,14 +155,38 @@ class JSONRPCApplication(ABC):
     (SSE).
     """
 
-    def __init__(
+    # Method-to-model mapping for centralized routing
+    A2ARequestModel = (
+        SendMessageRequest
+        | SendStreamingMessageRequest
+        | GetTaskRequest
+        | CancelTaskRequest
+        | SetTaskPushNotificationConfigRequest
+        | GetTaskPushNotificationConfigRequest
+        | ListTaskPushNotificationConfigRequest
+        | DeleteTaskPushNotificationConfigRequest
+        | TaskResubscriptionRequest
+        | GetAuthenticatedExtendedCardRequest
+    )
+
+    METHOD_TO_MODEL: dict[str, type[A2ARequestModel]] = {
+        model.model_fields['method'].default: model
+        for model in A2ARequestModel.__args__
+    }
+
+    def __init__(  # noqa: PLR0913
         self,
         agent_card: AgentCard,
         http_handler: RequestHandler,
         extended_agent_card: AgentCard | None = None,
         context_builder: CallContextBuilder | None = None,
+        card_modifier: Callable[[AgentCard], AgentCard] | None = None,
+        extended_card_modifier: Callable[
+            [AgentCard, ServerCallContext], AgentCard
+        ]
+        | None = None,
     ) -> None:
-        """Initializes the A2AStarletteApplication.
+        """Initializes the JSONRPCApplication.
 
         Args:
             agent_card: The AgentCard describing the agent's capabilities.
@@ -128,18 +197,35 @@ class JSONRPCApplication(ABC):
             context_builder: The CallContextBuilder used to construct the
               ServerCallContext passed to the http_handler. If None, no
               ServerCallContext is passed.
+            card_modifier: An optional callback to dynamically modify the public
+              agent card before it is served.
+            extended_card_modifier: An optional callback to dynamically modify
+              the extended agent card before it is served. It receives the
+              call context.
         """
+        if not _package_starlette_installed:
+            raise ImportError(
+                'Packages `starlette` and `sse-starlette` are required to use the'
+                ' `JSONRPCApplication`. They can be added as a part of `a2a-sdk`'
+                ' optional dependencies, `a2a-sdk[http-server]`.'
+            )
         self.agent_card = agent_card
         self.extended_agent_card = extended_agent_card
+        self.card_modifier = card_modifier
+        self.extended_card_modifier = extended_card_modifier
         self.handler = JSONRPCHandler(
-            agent_card=agent_card, request_handler=http_handler
+            agent_card=agent_card,
+            request_handler=http_handler,
+            extended_agent_card=extended_agent_card,
+            extended_card_modifier=extended_card_modifier,
         )
         if (
-            self.agent_card.supportsAuthenticatedExtendedCard
+            self.agent_card.supports_authenticated_extended_card
             and self.extended_agent_card is None
+            and self.extended_card_modifier is None
         ):
             logger.error(
-                'AgentCard.supportsAuthenticatedExtendedCard is True, but no extended_agent_card was provided. The /agent/authenticatedExtendedCard endpoint will return 404.'
+                'AgentCard.supports_authenticated_extended_card is True, but no extended_agent_card was provided. The /agent/authenticatedExtendedCard endpoint will return 404.'
             )
         self._context_builder = context_builder or DefaultCallContextBuilder()
 
@@ -170,9 +256,13 @@ class JSONRPCApplication(ABC):
         )
         logger.log(
             log_level,
-            f'Request Error (ID: {request_id}): '
-            f"Code={error_resp.error.code}, Message='{error_resp.error.message}'"
-            f'{", Data=" + str(error_resp.error.data) if error_resp.error.data else ""}',
+            "Request Error (ID: %s): Code=%s, Message='%s'%s",
+            request_id,
+            error_resp.error.code,
+            error_resp.error.message,
+            ', Data=' + str(error_resp.error.data)
+            if error_resp.error.data
+            else '',
         )
         return JSONResponse(
             error_resp.model_dump(mode='json', exclude_none=True),
@@ -202,10 +292,62 @@ class JSONRPCApplication(ABC):
 
         try:
             body = await request.json()
-            a2a_request = A2ARequest.model_validate(body)
+            if isinstance(body, dict):
+                request_id = body.get('id')
+                # Ensure request_id is valid for JSON-RPC response (str/int/None only)
+                if request_id is not None and not isinstance(
+                    request_id, str | int
+                ):
+                    request_id = None
+            # Treat very large payloads as invalid request (-32600) before routing
+            with contextlib.suppress(Exception):
+                content_length = int(request.headers.get('content-length', '0'))
+                if content_length and content_length > MAX_CONTENT_LENGTH:
+                    return self._generate_error_response(
+                        request_id,
+                        A2AError(
+                            root=InvalidRequestError(
+                                message='Payload too large'
+                            )
+                        ),
+                    )
+            logger.debug('Request body: %s', body)
+            # 1) Validate base JSON-RPC structure only (-32600 on failure)
+            try:
+                base_request = JSONRPCRequest.model_validate(body)
+            except ValidationError as e:
+                logger.exception('Failed to validate base JSON-RPC request')
+                return self._generate_error_response(
+                    request_id,
+                    A2AError(
+                        root=InvalidRequestError(data=json.loads(e.json()))
+                    ),
+                )
+
+            # 2) Route by method name; unknown -> -32601, known -> validate params (-32602 on failure)
+            method = base_request.method
+
+            model_class = self.METHOD_TO_MODEL.get(method)
+            if not model_class:
+                return self._generate_error_response(
+                    request_id, A2AError(root=MethodNotFoundError())
+                )
+            try:
+                specific_request = model_class.model_validate(body)
+            except ValidationError as e:
+                logger.exception('Failed to validate base JSON-RPC request')
+                return self._generate_error_response(
+                    request_id,
+                    A2AError(
+                        root=InvalidParamsError(data=json.loads(e.json()))
+                    ),
+                )
+
+            # 3) Build call context and wrap the request for downstream handling
             call_context = self._context_builder.build(request)
 
-            request_id = a2a_request.root.id
+            request_id = specific_request.id
+            a2a_request = A2ARequest(root=specific_request)
             request_obj = a2a_request.root
 
             if isinstance(
@@ -229,12 +371,6 @@ class JSONRPCApplication(ABC):
             return self._generate_error_response(
                 None, A2AError(root=JSONParseError(message=str(e)))
             )
-        except ValidationError as e:
-            traceback.print_exc()
-            return self._generate_error_response(
-                request_id,
-                A2AError(root=InvalidRequestError(data=json.loads(e.json()))),
-            )
         except HTTPException as e:
             if e.status_code == HTTP_413_REQUEST_ENTITY_TOO_LARGE:
                 return self._generate_error_response(
@@ -245,8 +381,7 @@ class JSONRPCApplication(ABC):
                 )
             raise e
         except Exception as e:
-            logger.error(f'Unhandled exception: {e}')
-            traceback.print_exc()
+            logger.exception('Unhandled exception')
             return self._generate_error_response(
                 request_id, A2AError(root=InternalError(message=str(e)))
             )
@@ -281,7 +416,7 @@ class JSONRPCApplication(ABC):
                 request_obj, context
             )
 
-        return self._create_response(handler_result)
+        return self._create_response(context, handler_result)
 
     async def _process_non_streaming_request(
         self,
@@ -342,9 +477,16 @@ class JSONRPCApplication(ABC):
                         context,
                     )
                 )
+            case GetAuthenticatedExtendedCardRequest():
+                handler_result = (
+                    await self.handler.get_authenticated_extended_card(
+                        request_obj,
+                        context,
+                    )
+                )
             case _:
                 logger.error(
-                    f'Unhandled validated request type: {type(request_obj)}'
+                    'Unhandled validated request type: %s', type(request_obj)
                 )
                 error = UnsupportedOperationError(
                     message=f'Request type {type(request_obj).__name__} is unknown.'
@@ -353,10 +495,11 @@ class JSONRPCApplication(ABC):
                     id=request_id, error=error
                 )
 
-        return self._create_response(handler_result)
+        return self._create_response(context, handler_result)
 
     def _create_response(
         self,
+        context: ServerCallContext,
         handler_result: (
             AsyncGenerator[SendStreamingMessageResponse]
             | JSONRPCErrorResponse
@@ -372,12 +515,16 @@ class JSONRPCApplication(ABC):
         payloads.
 
         Args:
+            context: The ServerCallContext provided to the request handler.
             handler_result: The result from a request handler method. Can be an
                 async generator for streaming or a Pydantic model for non-streaming.
 
         Returns:
             A Starlette JSONResponse or EventSourceResponse.
         """
+        headers = {}
+        if exts := context.activated_extensions:
+            headers[HTTP_EXTENSION_HEADER] = ', '.join(sorted(exts))
         if isinstance(handler_result, AsyncGenerator):
             # Result is a stream of SendStreamingMessageResponse objects
             async def event_generator(
@@ -386,17 +533,21 @@ class JSONRPCApplication(ABC):
                 async for item in stream:
                     yield {'data': item.root.model_dump_json(exclude_none=True)}
 
-            return EventSourceResponse(event_generator(handler_result))
+            return EventSourceResponse(
+                event_generator(handler_result), headers=headers
+            )
         if isinstance(handler_result, JSONRPCErrorResponse):
             return JSONResponse(
                 handler_result.model_dump(
                     mode='json',
                     exclude_none=True,
-                )
+                ),
+                headers=headers,
             )
 
         return JSONResponse(
-            handler_result.root.model_dump(mode='json', exclude_none=True)
+            handler_result.root.model_dump(mode='json', exclude_none=True),
+            headers=headers,
         )
 
     async def _handle_get_agent_card(self, request: Request) -> JSONResponse:
@@ -408,10 +559,20 @@ class JSONRPCApplication(ABC):
         Returns:
             A JSONResponse containing the agent card data.
         """
-        # The public agent card is a direct serialization of the agent_card
-        # provided at initialization.
+        if request.url.path == PREV_AGENT_CARD_WELL_KNOWN_PATH:
+            logger.warning(
+                "Deprecated agent card endpoint '%s' accessed. "
+                "Please use '%s' instead. This endpoint will be removed in a future version.",
+                PREV_AGENT_CARD_WELL_KNOWN_PATH,
+                AGENT_CARD_WELL_KNOWN_PATH,
+            )
+
+        card_to_serve = self.agent_card
+        if self.card_modifier:
+            card_to_serve = self.card_modifier(card_to_serve)
+
         return JSONResponse(
-            self.agent_card.model_dump(
+            card_to_serve.model_dump(
                 exclude_none=True,
                 by_alias=True,
             )
@@ -421,23 +582,34 @@ class JSONRPCApplication(ABC):
         self, request: Request
     ) -> JSONResponse:
         """Handles GET requests for the authenticated extended agent card."""
-        if not self.agent_card.supportsAuthenticatedExtendedCard:
+        logger.warning(
+            'HTTP GET for authenticated extended card has been called by a client. '
+            'This endpoint is deprecated in favor of agent/authenticatedExtendedCard JSON-RPC method and will be removed in a future release.'
+        )
+        if not self.agent_card.supports_authenticated_extended_card:
             return JSONResponse(
                 {'error': 'Extended agent card not supported or not enabled.'},
                 status_code=404,
             )
 
-        # If an explicit extended_agent_card is provided, serve that.
-        if self.extended_agent_card:
+        card_to_serve = self.extended_agent_card
+
+        if self.extended_card_modifier:
+            context = self._context_builder.build(request)
+            # If no base extended card is provided, pass the public card to the modifier
+            base_card = card_to_serve if card_to_serve else self.agent_card
+            card_to_serve = self.extended_card_modifier(base_card, context)
+
+        if card_to_serve:
             return JSONResponse(
-                self.extended_agent_card.model_dump(
+                card_to_serve.model_dump(
                     exclude_none=True,
                     by_alias=True,
                 )
             )
-        # If supportsAuthenticatedExtendedCard is true, but no specific
-        # extended_agent_card was provided during server initialization,
-        # return a 404
+        # If supports_authenticated_extended_card is true, but no
+        # extended_agent_card was provided, and no modifier produced a card,
+        # return a 404.
         return JSONResponse(
             {
                 'error': 'Authenticated extended agent card is supported but not configured on the server.'

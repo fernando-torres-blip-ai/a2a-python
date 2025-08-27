@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from a2a.client import A2AGrpcClient
+from a2a.client.transports.grpc import GrpcTransport
 from a2a.grpc import a2a_pb2, a2a_pb2_grpc
 from a2a.types import (
     AgentCapabilities,
@@ -18,7 +18,7 @@ from a2a.types import (
     TaskStatus,
     TextPart,
 )
-from a2a.utils import proto_utils
+from a2a.utils import get_text_parts, proto_utils
 
 
 # Fixtures
@@ -43,19 +43,22 @@ def sample_agent_card() -> AgentCard:
         description='Agent for testing gRPC client',
         url='grpc://localhost:50051',
         version='1.0',
-        capabilities=AgentCapabilities(streaming=True, pushNotifications=True),
-        defaultInputModes=['text/plain'],
-        defaultOutputModes=['text/plain'],
+        capabilities=AgentCapabilities(streaming=True, push_notifications=True),
+        default_input_modes=['text/plain'],
+        default_output_modes=['text/plain'],
         skills=[],
     )
 
 
 @pytest.fixture
-def grpc_client(
+def grpc_transport(
     mock_grpc_stub: AsyncMock, sample_agent_card: AgentCard
-) -> A2AGrpcClient:
-    """Provides an A2AGrpcClient instance."""
-    return A2AGrpcClient(grpc_stub=mock_grpc_stub, agent_card=sample_agent_card)
+) -> GrpcTransport:
+    """Provides a GrpcTransport instance."""
+    channel = AsyncMock()
+    transport = GrpcTransport(channel=channel, agent_card=sample_agent_card)
+    transport.stub = mock_grpc_stub
+    return transport
 
 
 @pytest.fixture
@@ -64,7 +67,7 @@ def sample_message_send_params() -> MessageSendParams:
     return MessageSendParams(
         message=Message(
             role=Role.user,
-            messageId='msg-1',
+            message_id='msg-1',
             parts=[Part(root=TextPart(text='Hello'))],
         )
     )
@@ -75,7 +78,7 @@ def sample_task() -> Task:
     """Provides a sample Task object."""
     return Task(
         id='task-1',
-        contextId='ctx-1',
+        context_id='ctx-1',
         status=TaskStatus(state=TaskState.completed),
     )
 
@@ -85,14 +88,14 @@ def sample_message() -> Message:
     """Provides a sample Message object."""
     return Message(
         role=Role.agent,
-        messageId='msg-response',
+        message_id='msg-response',
         parts=[Part(root=TextPart(text='Hi there'))],
     )
 
 
 @pytest.mark.asyncio
 async def test_send_message_task_response(
-    grpc_client: A2AGrpcClient,
+    grpc_transport: GrpcTransport,
     mock_grpc_stub: AsyncMock,
     sample_message_send_params: MessageSendParams,
     sample_task: Task,
@@ -102,7 +105,7 @@ async def test_send_message_task_response(
         task=proto_utils.ToProto.task(sample_task)
     )
 
-    response = await grpc_client.send_message(sample_message_send_params)
+    response = await grpc_transport.send_message(sample_message_send_params)
 
     mock_grpc_stub.SendMessage.assert_awaited_once()
     assert isinstance(response, Task)
@@ -110,24 +113,66 @@ async def test_send_message_task_response(
 
 
 @pytest.mark.asyncio
+async def test_send_message_message_response(
+    grpc_transport: GrpcTransport,
+    mock_grpc_stub: AsyncMock,
+    sample_message_send_params: MessageSendParams,
+    sample_message: Message,
+):
+    """Test send_message that returns a Message."""
+    mock_grpc_stub.SendMessage.return_value = a2a_pb2.SendMessageResponse(
+        msg=proto_utils.ToProto.message(sample_message)
+    )
+
+    response = await grpc_transport.send_message(sample_message_send_params)
+
+    mock_grpc_stub.SendMessage.assert_awaited_once()
+    assert isinstance(response, Message)
+    assert response.message_id == sample_message.message_id
+    assert get_text_parts(response.parts) == get_text_parts(
+        sample_message.parts
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_task(
-    grpc_client: A2AGrpcClient, mock_grpc_stub: AsyncMock, sample_task: Task
+    grpc_transport: GrpcTransport, mock_grpc_stub: AsyncMock, sample_task: Task
 ):
     """Test retrieving a task."""
     mock_grpc_stub.GetTask.return_value = proto_utils.ToProto.task(sample_task)
     params = TaskQueryParams(id=sample_task.id)
 
-    response = await grpc_client.get_task(params)
+    response = await grpc_transport.get_task(params)
 
     mock_grpc_stub.GetTask.assert_awaited_once_with(
-        a2a_pb2.GetTaskRequest(name=f'tasks/{sample_task.id}')
+        a2a_pb2.GetTaskRequest(
+            name=f'tasks/{sample_task.id}', history_length=None
+        )
     )
     assert response.id == sample_task.id
 
 
 @pytest.mark.asyncio
+async def test_get_task_with_history(
+    grpc_transport: GrpcTransport, mock_grpc_stub: AsyncMock, sample_task: Task
+):
+    """Test retrieving a task with history."""
+    mock_grpc_stub.GetTask.return_value = proto_utils.ToProto.task(sample_task)
+    history_len = 10
+    params = TaskQueryParams(id=sample_task.id, history_length=history_len)
+
+    await grpc_transport.get_task(params)
+
+    mock_grpc_stub.GetTask.assert_awaited_once_with(
+        a2a_pb2.GetTaskRequest(
+            name=f'tasks/{sample_task.id}', history_length=history_len
+        )
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancel_task(
-    grpc_client: A2AGrpcClient, mock_grpc_stub: AsyncMock, sample_task: Task
+    grpc_transport: GrpcTransport, mock_grpc_stub: AsyncMock, sample_task: Task
 ):
     """Test cancelling a task."""
     cancelled_task = sample_task.model_copy()
@@ -137,7 +182,7 @@ async def test_cancel_task(
     )
     params = TaskIdParams(id=sample_task.id)
 
-    response = await grpc_client.cancel_task(params)
+    response = await grpc_transport.cancel_task(params)
 
     mock_grpc_stub.CancelTask.assert_awaited_once_with(
         a2a_pb2.CancelTaskRequest(name=f'tasks/{sample_task.id}')

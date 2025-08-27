@@ -59,26 +59,58 @@ import inspect
 import logging
 
 from collections.abc import Callable
-from typing import Any, TypeAlias
-
-from opentelemetry import trace
-from opentelemetry.trace import SpanKind as _SpanKind
-from opentelemetry.trace import StatusCode
+from typing import TYPE_CHECKING, Any
 
 
-SpanKind: TypeAlias = _SpanKind
-__all__ = ['SpanKind']
-INSTRUMENTING_MODULE_NAME = 'a2a-python-sdk'
-INSTRUMENTING_MODULE_VERSION = '1.0.0'
+if TYPE_CHECKING:
+    from opentelemetry.trace import SpanKind as SpanKindType
+else:
+    SpanKindType = object
 
 logger = logging.getLogger(__name__)
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind as _SpanKind
+    from opentelemetry.trace import StatusCode
+
+except ImportError:
+    logger.debug(
+        'OpenTelemetry not found. Tracing will be disabled. '
+        'Install with: \'pip install "a2a-sdk[telemetry]"\''
+    )
+
+    class _NoOp:
+        """A no-op object that absorbs all tracing calls when OpenTelemetry is not installed."""
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return self
+
+        def __enter__(self) -> '_NoOp':
+            return self
+
+        def __exit__(self, *args: object, **kwargs: Any) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> Any:
+            return self
+
+    trace = _NoOp()  # type: ignore
+    _SpanKind = _NoOp()  # type: ignore
+    StatusCode = _NoOp()  # type: ignore
+
+SpanKind = _SpanKind
+__all__ = ['SpanKind']
+
+INSTRUMENTING_MODULE_NAME = 'a2a-python-sdk'
+INSTRUMENTING_MODULE_VERSION = '1.0.0'
 
 
 def trace_function(  # noqa: PLR0915
     func: Callable | None = None,
     *,
     span_name: str | None = None,
-    kind: SpanKind = SpanKind.INTERNAL,
+    kind: SpanKindType = SpanKind.INTERNAL,
     attributes: dict[str, Any] | None = None,
     attribute_extractor: Callable | None = None,
 ) -> Callable:
@@ -139,7 +171,9 @@ def trace_function(  # noqa: PLR0915
     is_async_func = inspect.iscoroutinefunction(func)
 
     logger.debug(
-        f'Start tracing for {actual_span_name}, is_async_func {is_async_func}'
+        'Start tracing for %s, is_async_func %s',
+        actual_span_name,
+        is_async_func,
     )
 
     @functools.wraps(func)
@@ -161,12 +195,10 @@ def trace_function(  # noqa: PLR0915
                 # Async wrapper, await for the function call to complete.
                 result = await func(*args, **kwargs)
                 span.set_status(StatusCode.OK)
-                return result
-
             # asyncio.CancelledError extends from BaseException
             except asyncio.CancelledError as ce:
                 exception = None
-                logger.debug(f'CancelledError in span {actual_span_name}')
+                logger.debug('CancelledError in span %s', actual_span_name)
                 span.record_exception(ce)
                 raise
             except Exception as e:
@@ -180,10 +212,12 @@ def trace_function(  # noqa: PLR0915
                         attribute_extractor(
                             span, args, kwargs, result, exception
                         )
-                    except Exception as attr_e:
-                        logger.error(
-                            f'attribute_extractor error in span {actual_span_name}: {attr_e}'
+                    except Exception:
+                        logger.exception(
+                            'attribute_extractor error in span %s',
+                            actual_span_name,
                         )
+            return result
 
     @functools.wraps(func)
     def sync_wrapper(*args, **kwargs) -> Any:
@@ -201,7 +235,6 @@ def trace_function(  # noqa: PLR0915
                 # Sync wrapper, execute the function call.
                 result = func(*args, **kwargs)
                 span.set_status(StatusCode.OK)
-                return result
 
             except Exception as e:
                 exception = e
@@ -214,10 +247,12 @@ def trace_function(  # noqa: PLR0915
                         attribute_extractor(
                             span, args, kwargs, result, exception
                         )
-                    except Exception as attr_e:
-                        logger.error(
-                            f'attribute_extractor error in span {actual_span_name}: {attr_e}'
+                    except Exception:
+                        logger.exception(
+                            'attribute_extractor error in span %s',
+                            actual_span_name,
                         )
+            return result
 
     return async_wrapper if is_async_func else sync_wrapper
 
@@ -225,7 +260,7 @@ def trace_function(  # noqa: PLR0915
 def trace_class(
     include_list: list[str] | None = None,
     exclude_list: list[str] | None = None,
-    kind: SpanKind = SpanKind.INTERNAL,
+    kind: SpanKindType = SpanKind.INTERNAL,
 ) -> Callable:
     """A class decorator to automatically trace specified methods of a class.
 
@@ -276,26 +311,19 @@ def trace_class(
                 pass
         ```
     """
-    logger.debug(f'Trace all class {include_list}, {exclude_list}')
+    logger.debug('Trace all class %s, %s', include_list, exclude_list)
     exclude_list = exclude_list or []
 
     def decorator(cls: Any) -> Any:
-        all_methods = {}
         for name, method in inspect.getmembers(cls, inspect.isfunction):
-            # Skip Dunders
             if name.startswith('__') and name.endswith('__'):
                 continue
-
-            # Skip if include list is defined but the method not included.
             if include_list and name not in include_list:
                 continue
-            # Skip if include list is not defined but the method is in excludes.
             if not include_list and name in exclude_list:
                 continue
 
-            all_methods[name] = method
             span_name = f'{cls.__module__}.{cls.__name__}.{name}'
-            # Set the decorator on the method.
             setattr(
                 cls,
                 name,

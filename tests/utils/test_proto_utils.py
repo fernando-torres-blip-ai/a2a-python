@@ -14,15 +14,19 @@ from a2a.utils.errors import ServerError
 @pytest.fixture
 def sample_message() -> types.Message:
     return types.Message(
-        messageId='msg-1',
-        contextId='ctx-1',
-        taskId='task-1',
+        message_id='msg-1',
+        context_id='ctx-1',
+        task_id='task-1',
         role=types.Role.user,
         parts=[
             types.Part(root=types.TextPart(text='Hello')),
             types.Part(
                 root=types.FilePart(
-                    file=types.FileWithUri(uri='file:///test.txt')
+                    file=types.FileWithUri(
+                        uri='file:///test.txt',
+                        name='test.txt',
+                        mime_type='text/plain',
+                    ),
                 )
             ),
             types.Part(root=types.DataPart(data={'key': 'value'})),
@@ -35,14 +39,14 @@ def sample_message() -> types.Message:
 def sample_task(sample_message: types.Message) -> types.Task:
     return types.Task(
         id='task-1',
-        contextId='ctx-1',
+        context_id='ctx-1',
         status=types.TaskStatus(
             state=types.TaskState.working, message=sample_message
         ),
         history=[sample_message],
         artifacts=[
             types.Artifact(
-                artifactId='art-1',
+                artifact_id='art-1',
                 parts=[
                     types.Part(root=types.TextPart(text='Artifact content'))
                 ],
@@ -59,10 +63,10 @@ def sample_agent_card() -> types.AgentCard:
         url='http://localhost',
         version='1.0.0',
         capabilities=types.AgentCapabilities(
-            streaming=True, pushNotifications=True
+            streaming=True, push_notifications=True
         ),
-        defaultInputModes=['text/plain'],
-        defaultOutputModes=['text/plain'],
+        default_input_modes=['text/plain'],
+        default_output_modes=['text/plain'],
         skills=[
             types.AgentSkill(
                 id='skill1',
@@ -75,12 +79,12 @@ def sample_agent_card() -> types.AgentCard:
             organization='Test Org', url='http://test.org'
         ),
         security=[{'oauth_scheme': ['read', 'write']}],
-        securitySchemes={
+        security_schemes={
             'oauth_scheme': types.SecurityScheme(
                 root=types.OAuth2SecurityScheme(
                     flows=types.OAuthFlows(
-                        clientCredentials=types.ClientCredentialsOAuthFlow(
-                            tokenUrl='http://token.url',
+                        client_credentials=types.ClientCredentialsOAuthFlow(
+                            token_url='http://token.url',
                             scopes={
                                 'read': 'Read access',
                                 'write': 'Write access',
@@ -99,7 +103,7 @@ def sample_agent_card() -> types.AgentCard:
             ),
             'oidc': types.SecurityScheme(
                 root=types.OpenIdConnectSecurityScheme(
-                    openIdConnectUrl='http://oidc.url'
+                    open_id_connect_url='http://oidc.url'
                 )
             ),
         },
@@ -148,6 +152,8 @@ class TestProtoUtils:
 
         # Test file part handling
         assert proto_msg.content[1].file.file_with_uri == 'file:///test.txt'
+        assert proto_msg.content[1].file.mime_type == 'text/plain'
+        assert proto_msg.content[1].file.name == 'test.txt'
 
         roundtrip_msg = proto_utils.FromProto.message(proto_msg)
         assert roundtrip_msg == sample_message
@@ -189,7 +195,7 @@ class TestProtoUtils:
         # Test password flow
         password_flow = types.OAuthFlows(
             password=types.PasswordOAuthFlow(
-                tokenUrl='http://token.url', scopes={'read': 'Read'}
+                token_url='http://token.url', scopes={'read': 'Read'}
             )
         )
         proto_password_flow = proto_utils.ToProto.oauth2_flows(password_flow)
@@ -198,7 +204,7 @@ class TestProtoUtils:
         # Test implicit flow
         implicit_flow = types.OAuthFlows(
             implicit=types.ImplicitOAuthFlow(
-                authorizationUrl='http://auth.url', scopes={'read': 'Read'}
+                authorization_url='http://auth.url', scopes={'read': 'Read'}
             )
         )
         proto_implicit_flow = proto_utils.ToProto.oauth2_flows(implicit_flow)
@@ -206,9 +212,9 @@ class TestProtoUtils:
 
         # Test authorization code flow
         auth_code_flow = types.OAuthFlows(
-            authorizationCode=types.AuthorizationCodeOAuthFlow(
-                authorizationUrl='http://auth.url',
-                tokenUrl='http://token.url',
+            authorization_code=types.AuthorizationCodeOAuthFlow(
+                authorization_url='http://auth.url',
+                token_url='http://token.url',
                 scopes={'read': 'read'},
             )
         )
@@ -237,9 +243,7 @@ class TestProtoUtils:
         assert isinstance(exc_info.value.error, types.InvalidParamsError)
 
     def test_task_push_config_from_proto_invalid_parent(self):
-        request = a2a_pb2.CreateTaskPushNotificationConfigRequest(
-            parent='invalid-parent'
-        )
+        request = a2a_pb2.TaskPushNotificationConfig(name='invalid-name-format')
         with pytest.raises(ServerError) as exc_info:
             proto_utils.FromProto.task_push_notification_config(request)
         assert isinstance(exc_info.value.error, types.InvalidParamsError)

@@ -1,6 +1,7 @@
 """General utility functions for the A2A Python SDK."""
 
 import functools
+import inspect
 import logging
 
 from collections.abc import Callable
@@ -36,12 +37,12 @@ def create_task_obj(message_send_params: MessageSendParams) -> Task:
     Returns:
         A new `Task` object initialized with 'submitted' status and the input message in history.
     """
-    if not message_send_params.message.contextId:
-        message_send_params.message.contextId = str(uuid4())
+    if not message_send_params.message.context_id:
+        message_send_params.message.context_id = str(uuid4())
 
     return Task(
         id=str(uuid4()),
-        contextId=message_send_params.message.contextId,
+        context_id=message_send_params.message.context_id,
         status=TaskStatus(state=TaskState.submitted),
         history=[message_send_params.message],
     )
@@ -62,7 +63,7 @@ def append_artifact_to_task(task: Task, event: TaskArtifactUpdateEvent) -> None:
         task.artifacts = []
 
     new_artifact_data: Artifact = event.artifact
-    artifact_id: str = new_artifact_data.artifactId
+    artifact_id: str = new_artifact_data.artifact_id
     append_parts: bool = event.append or False
 
     existing_artifact: Artifact | None = None
@@ -70,7 +71,7 @@ def append_artifact_to_task(task: Task, event: TaskArtifactUpdateEvent) -> None:
 
     # Find existing artifact by its id
     for i, art in enumerate(task.artifacts):
-        if art.artifactId == artifact_id:
+        if art.artifact_id == artifact_id:
             existing_artifact = art
             existing_artifact_list_index = i
             break
@@ -80,26 +81,32 @@ def append_artifact_to_task(task: Task, event: TaskArtifactUpdateEvent) -> None:
         if existing_artifact_list_index is not None:
             # Replace the existing artifact entirely with the new data
             logger.debug(
-                f'Replacing artifact at id {artifact_id} for task {task.id}'
+                'Replacing artifact at id %s for task %s', artifact_id, task.id
             )
             task.artifacts[existing_artifact_list_index] = new_artifact_data
         else:
             # Append the new artifact since no artifact with this index exists yet
             logger.debug(
-                f'Adding new artifact with id {artifact_id} for task {task.id}'
+                'Adding new artifact with id %s for task %s',
+                artifact_id,
+                task.id,
             )
             task.artifacts.append(new_artifact_data)
     elif existing_artifact:
         # Append new parts to the existing artifact's part list
         logger.debug(
-            f'Appending parts to artifact id {artifact_id} for task {task.id}'
+            'Appending parts to artifact id %s for task %s',
+            artifact_id,
+            task.id,
         )
         existing_artifact.parts.extend(new_artifact_data.parts)
     else:
         # We received a chunk to append, but we don't have an existing artifact.
         # we will ignore this chunk
         logger.warning(
-            f'Received append=True for nonexistent artifact index {artifact_id} in task {task.id}. Ignoring chunk.'
+            'Received append=True for nonexistent artifact index %s in task %s. Ignoring chunk.',
+            artifact_id,
+            task.id,
         )
 
 
@@ -115,7 +122,7 @@ def build_text_artifact(text: str, artifact_id: str) -> Artifact:
     """
     text_part = TextPart(text=text)
     part = Part(root=text_part)
-    return Artifact(parts=[part], artifactId=artifact_id)
+    return Artifact(parts=[part], artifact_id=artifact_id)
 
 
 def validate(
@@ -135,16 +142,31 @@ def validate(
     """
 
     def decorator(function: Callable) -> Callable:
-        def wrapper(self: Any, *args, **kwargs) -> Any:
+        if inspect.iscoroutinefunction(function):
+
+            @functools.wraps(function)
+            async def async_wrapper(self: Any, *args, **kwargs) -> Any:
+                if not expression(self):
+                    final_message = error_message or str(expression)
+                    logger.error('Unsupported Operation: %s', final_message)
+                    raise ServerError(
+                        UnsupportedOperationError(message=final_message)
+                    )
+                return await function(self, *args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(function)
+        def sync_wrapper(self: Any, *args, **kwargs) -> Any:
             if not expression(self):
                 final_message = error_message or str(expression)
-                logger.error(f'Unsupported Operation: {final_message}')
+                logger.error('Unsupported Operation: %s', final_message)
                 raise ServerError(
                     UnsupportedOperationError(message=final_message)
                 )
             return function(self, *args, **kwargs)
 
-        return wrapper
+        return sync_wrapper
 
     return decorator
 
@@ -170,7 +192,7 @@ def validate_async_generator(
         async def wrapper(self, *args, **kwargs):
             if not expression(self):
                 final_message = error_message or str(expression)
-                logger.error(f'Unsupported Operation: {final_message}')
+                logger.error('Unsupported Operation: %s', final_message)
                 raise ServerError(
                     UnsupportedOperationError(message=final_message)
                 )

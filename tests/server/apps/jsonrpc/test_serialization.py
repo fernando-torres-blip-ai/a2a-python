@@ -2,6 +2,7 @@ from unittest import mock
 
 import pytest
 
+from fastapi import FastAPI
 from pydantic import ValidationError
 from starlette.testclient import TestClient
 
@@ -32,19 +33,18 @@ def agent_card_with_api_key():
     }
     api_key_scheme = APIKeySecurityScheme.model_validate(api_key_scheme_data)
 
-    agent_card = AgentCard(
+    return AgentCard(
         name='APIKeyAgent',
         description='An agent that uses API Key auth.',
         url='http://example.com/apikey-agent',
         version='1.0.0',
         capabilities=AgentCapabilities(),
-        defaultInputModes=['text/plain'],
-        defaultOutputModes=['text/plain'],
+        default_input_modes=['text/plain'],
+        default_output_modes=['text/plain'],
         skills=[],
-        securitySchemes={'api_key_auth': SecurityScheme(root=api_key_scheme)},
+        security_schemes={'api_key_auth': SecurityScheme(root=api_key_scheme)},
         security=[{'api_key_auth': []}],
     )
-    return agent_card
 
 
 def test_starlette_agent_card_with_api_key_scheme_alias(
@@ -59,7 +59,7 @@ def test_starlette_agent_card_with_api_key_scheme_alias(
     app_instance = A2AStarletteApplication(agent_card_with_api_key, handler)
     client = TestClient(app_instance.build())
 
-    response = client.get('/.well-known/agent.json')
+    response = client.get('/.well-known/agent-card.json')
     assert response.status_code == 200
     response_data = response.json()
 
@@ -70,7 +70,7 @@ def test_starlette_agent_card_with_api_key_scheme_alias(
 
     try:
         parsed_card = AgentCard.model_validate(response_data)
-        parsed_scheme_wrapper = parsed_card.securitySchemes['api_key_auth']
+        parsed_scheme_wrapper = parsed_card.security_schemes['api_key_auth']
         assert isinstance(parsed_scheme_wrapper.root, APIKeySecurityScheme)
         assert parsed_scheme_wrapper.root.in_ == In.header
     except ValidationError as e:
@@ -91,7 +91,7 @@ def test_fastapi_agent_card_with_api_key_scheme_alias(
     app_instance = A2AFastAPIApplication(agent_card_with_api_key, handler)
     client = TestClient(app_instance.build())
 
-    response = client.get('/.well-known/agent.json')
+    response = client.get('/.well-known/agent-card.json')
     assert response.status_code == 200
     response_data = response.json()
 
@@ -145,7 +145,7 @@ def test_handle_oversized_payload(agent_card_with_api_key: AgentCard):
             assert response.status_code == 413
     except Exception as e:
         # Depending on server setup, it might just drop the connection for very large payloads
-        assert isinstance(e, (ConnectionResetError, RuntimeError))
+        assert isinstance(e, ConnectionResetError | RuntimeError)
 
 
 def test_handle_unicode_characters(agent_card_with_api_key: AgentCard):
@@ -163,7 +163,7 @@ def test_handle_unicode_characters(agent_card_with_api_key: AgentCard):
             'message': {
                 'role': 'user',
                 'parts': [{'kind': 'text', 'text': unicode_text}],
-                'messageId': 'msg-unicode',
+                'message_id': 'msg-unicode',
             }
         },
     }
@@ -172,7 +172,7 @@ def test_handle_unicode_characters(agent_card_with_api_key: AgentCard):
     handler.on_message_send.return_value = Message(
         role=Role.agent,
         parts=[Part(root=TextPart(text=f'Received: {unicode_text}'))],
-        messageId='response-unicode',
+        message_id='response-unicode',
     )
 
     response = client.post('/', json=unicode_payload)
@@ -184,3 +184,21 @@ def test_handle_unicode_characters(agent_card_with_api_key: AgentCard):
     data = response.json()
     assert 'error' not in data or data['error'] is None
     assert data['result']['parts'][0]['text'] == f'Received: {unicode_text}'
+
+
+def test_fastapi_sub_application(agent_card_with_api_key: AgentCard):
+    """
+    Tests that the A2AFastAPIApplication endpoint correctly passes the url in sub-application.
+    """
+    handler = mock.AsyncMock()
+    sub_app_instance = A2AFastAPIApplication(agent_card_with_api_key, handler)
+    app_instance = FastAPI()
+    app_instance.mount('/a2a', sub_app_instance.build())
+    client = TestClient(app_instance)
+
+    response = client.get('/a2a/openapi.json')
+    assert response.status_code == 200
+    response_data = response.json()
+
+    assert 'servers' in response_data
+    assert response_data['servers'] == [{'url': '/a2a'}]

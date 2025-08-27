@@ -2,12 +2,13 @@ import logging
 
 
 try:
-    from sqlalchemy import delete, select
+    from sqlalchemy import Table, delete, select
     from sqlalchemy.ext.asyncio import (
         AsyncEngine,
         AsyncSession,
         async_sessionmaker,
     )
+    from sqlalchemy.orm import class_mapper
 except ImportError as e:
     raise ImportError(
         'DatabaseTaskStore requires SQLAlchemy and a database driver. '
@@ -52,7 +53,8 @@ class DatabaseTaskStore(TaskStore):
             table_name: Name of the database table. Defaults to 'tasks'.
         """
         logger.debug(
-            f'Initializing DatabaseTaskStore with existing engine, table: {table_name}'
+            'Initializing DatabaseTaskStore with existing engine, table: %s',
+            table_name,
         )
         self.engine = engine
         self.async_session_maker = async_sessionmaker(
@@ -75,8 +77,13 @@ class DatabaseTaskStore(TaskStore):
         logger.debug('Initializing database schema...')
         if self.create_table:
             async with self.engine.begin() as conn:
-                # This will create the 'tasks' table based on TaskModel's definition
-                await conn.run_sync(Base.metadata.create_all)
+                mapper = class_mapper(self.task_model)
+                tables_to_create = [
+                    table for table in mapper.tables if isinstance(table, Table)
+                ]
+                await conn.run_sync(
+                    Base.metadata.create_all, tables=tables_to_create
+                )
         self._initialized = True
         logger.debug('Database schema initialized.')
 
@@ -89,7 +96,7 @@ class DatabaseTaskStore(TaskStore):
         """Maps a Pydantic Task to a SQLAlchemy TaskModel instance."""
         return self.task_model(
             id=task.id,
-            contextId=task.contextId,
+            context_id=task.context_id,
             kind=task.kind,
             status=task.status,
             artifacts=task.artifacts,
@@ -102,7 +109,7 @@ class DatabaseTaskStore(TaskStore):
         # Map database columns to Pydantic model fields
         task_data_from_db = {
             'id': task_model.id,
-            'contextId': task_model.contextId,
+            'context_id': task_model.context_id,
             'kind': task_model.kind,
             'status': task_model.status,
             'artifacts': task_model.artifacts,
@@ -118,7 +125,7 @@ class DatabaseTaskStore(TaskStore):
         db_task = self._to_orm(task)
         async with self.async_session_maker.begin() as session:
             await session.merge(db_task)
-            logger.debug(f'Task {task.id} saved/updated successfully.')
+            logger.debug('Task %s saved/updated successfully.', task.id)
 
     async def get(self, task_id: str) -> Task | None:
         """Retrieves a task from the database by ID."""
@@ -129,10 +136,10 @@ class DatabaseTaskStore(TaskStore):
             task_model = result.scalar_one_or_none()
             if task_model:
                 task = self._from_orm(task_model)
-                logger.debug(f'Task {task_id} retrieved successfully.')
+                logger.debug('Task %s retrieved successfully.', task_id)
                 return task
 
-            logger.debug(f'Task {task_id} not found in store.')
+            logger.debug('Task %s not found in store.', task_id)
             return None
 
     async def delete(self, task_id: str) -> None:
@@ -145,8 +152,8 @@ class DatabaseTaskStore(TaskStore):
             # Commit is automatic when using session.begin()
 
             if result.rowcount > 0:
-                logger.info(f'Task {task_id} deleted successfully.')
+                logger.info('Task %s deleted successfully.', task_id)
             else:
                 logger.warning(
-                    f'Attempted to delete nonexistent task with id: {task_id}'
+                    'Attempted to delete nonexistent task with id: %s', task_id
                 )

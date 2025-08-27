@@ -16,7 +16,7 @@ from a2a.types import Artifact, Message, TaskStatus
 
 
 try:
-    from sqlalchemy import JSON, Dialect, String
+    from sqlalchemy import JSON, Dialect, LargeBinary, String
     from sqlalchemy.orm import (
         DeclarativeBase,
         Mapped,
@@ -123,7 +123,7 @@ class TaskMixin:
     """Mixin providing standard task columns with proper type handling."""
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, index=True)
-    contextId: Mapped[str] = mapped_column(String(36), nullable=False)  # noqa: N815
+    context_id: Mapped[str] = mapped_column(String(36), nullable=False)
     kind: Mapped[str] = mapped_column(
         String(16), nullable=False, default='task'
     )
@@ -147,14 +147,9 @@ class TaskMixin:
     @override
     def __repr__(self) -> str:
         """Return a string representation of the task."""
-        repr_template = (
-            '<{CLS}(id="{ID}", contextId="{CTX_ID}", status="{STATUS}")>'
-        )
-        return repr_template.format(
-            CLS=self.__class__.__name__,
-            ID=self.id,
-            CTX_ID=self.contextId,
-            STATUS=self.status,
+        return (
+            f'<{self.__class__.__name__}(id="{self.id}", '
+            f'context_id="{self.context_id}", status="{self.status}")>'
         )
 
 
@@ -182,18 +177,15 @@ def create_task_model(
         TaskModel = create_task_model('tasks', MyBase)
     """
 
-    class TaskModel(TaskMixin, base):
+    class TaskModel(TaskMixin, base):  # type: ignore
         __tablename__ = table_name
 
         @override
         def __repr__(self) -> str:
             """Return a string representation of the task."""
-            repr_template = '<TaskModel[{TABLE}](id="{ID}", contextId="{CTX_ID}", status="{STATUS}")>'
-            return repr_template.format(
-                TABLE=table_name,
-                ID=self.id,
-                CTX_ID=self.contextId,
-                STATUS=self.status,
+            return (
+                f'<TaskModel[{table_name}](id="{self.id}", '
+                f'context_id="{self.context_id}", status="{self.status}")>'
             )
 
     # Set a dynamic name for better debugging
@@ -208,3 +200,54 @@ class TaskModel(TaskMixin, Base):
     """Default task model with standard table name."""
 
     __tablename__ = 'tasks'
+
+
+# PushNotificationConfigMixin that can be used with any table name
+class PushNotificationConfigMixin:
+    """Mixin providing standard push notification config columns."""
+
+    task_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    config_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    config_data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    @override
+    def __repr__(self) -> str:
+        """Return a string representation of the push notification config."""
+        return (
+            f'<{self.__class__.__name__}(task_id="{self.task_id}", '
+            f'config_id="{self.config_id}")>'
+        )
+
+
+def create_push_notification_config_model(
+    table_name: str = 'push_notification_configs',
+    base: type[DeclarativeBase] = Base,
+) -> type:
+    """Create a PushNotificationConfigModel class with a configurable table name."""
+
+    class PushNotificationConfigModel(PushNotificationConfigMixin, base):  # type: ignore
+        __tablename__ = table_name
+
+        @override
+        def __repr__(self) -> str:
+            """Return a string representation of the push notification config."""
+            return (
+                f'<PushNotificationConfigModel[{table_name}]('
+                f'task_id="{self.task_id}", config_id="{self.config_id}")>'
+            )
+
+    PushNotificationConfigModel.__name__ = (
+        f'PushNotificationConfigModel_{table_name}'
+    )
+    PushNotificationConfigModel.__qualname__ = (
+        f'PushNotificationConfigModel_{table_name}'
+    )
+
+    return PushNotificationConfigModel
+
+
+# Default PushNotificationConfigModel for backward compatibility
+class PushNotificationConfigModel(PushNotificationConfigMixin, Base):
+    """Default push notification config model with standard table name."""
+
+    __tablename__ = 'push_notification_configs'

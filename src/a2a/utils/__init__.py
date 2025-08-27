@@ -9,6 +9,7 @@ from a2a.utils.constants import (
     AGENT_CARD_WELL_KNOWN_PATH,
     DEFAULT_RPC_URL,
     EXTENDED_AGENT_CARD_PATH,
+    PREV_AGENT_CARD_WELL_KNOWN_PATH,
 )
 from a2a.utils.helpers import (
     append_artifact_to_task,
@@ -17,6 +18,8 @@ from a2a.utils.helpers import (
     create_task_obj,
 )
 from a2a.utils.message import (
+    get_data_parts,
+    get_file_parts,
     get_message_text,
     get_text_parts,
     new_agent_parts_message,
@@ -32,11 +35,14 @@ __all__ = [
     'AGENT_CARD_WELL_KNOWN_PATH',
     'DEFAULT_RPC_URL',
     'EXTENDED_AGENT_CARD_PATH',
+    'PREV_AGENT_CARD_WELL_KNOWN_PATH',
     'append_artifact_to_task',
     'are_modalities_compatible',
     'build_text_artifact',
     'completed_task',
     'create_task_obj',
+    'get_data_parts',
+    'get_file_parts',
     'get_message_text',
     'get_text_parts',
     'new_agent_parts_message',

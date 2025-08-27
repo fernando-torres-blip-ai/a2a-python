@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 
 from a2a.server.events import Event, EventConsumer
 from a2a.server.tasks.task_manager import TaskManager
@@ -24,7 +24,10 @@ class ResultAggregator:
        Task object and emit that Task object.
     """
 
-    def __init__(self, task_manager: TaskManager):
+    def __init__(
+        self,
+        task_manager: TaskManager,
+    ) -> None:
         """Initializes the ResultAggregator.
 
         Args:
@@ -92,15 +95,25 @@ class ResultAggregator:
         return await self.task_manager.get_task()
 
     async def consume_and_break_on_interrupt(
-        self, consumer: EventConsumer
+        self,
+        consumer: EventConsumer,
+        blocking: bool = True,
+        event_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[Task | Message | None, bool]:
         """Processes the event stream until completion or an interruptable state is encountered.
 
-        Interruptable states currently include `TaskState.auth_required`.
+        If `blocking` is False, it returns after the first event that creates a Task or Message.
+        If `blocking` is True, it waits for completion unless an `auth_required`
+        state is encountered, which is always an interruption.
         If interrupted, consumption continues in a background task.
 
         Args:
             consumer: The `EventConsumer` to read events from.
+            blocking: If `False`, the method returns as soon as a task/message
+                      is available. If `True`, it waits for a terminal state.
+            event_callback: Optional async callback function to be called after each event
+                           is processed in the background continuation.
+                           Mainly used for push notifications currently.
 
         Returns:
             A tuple containing:
@@ -117,10 +130,15 @@ class ResultAggregator:
                 self._message = event
                 return event, False
             await self.task_manager.process(event)
-            if (
+
+            should_interrupt = False
+            is_auth_required = (
                 isinstance(event, Task | TaskStatusUpdateEvent)
                 and event.status.state == TaskState.auth_required
-            ):
+            )
+
+            # Always interrupt on auth_required, as it needs external action.
+            if is_auth_required:
                 # auth-required is a special state: the message should be
                 # escalated back to the caller, but the agent is expected to
                 # continue producing events once the authorization is received
@@ -130,14 +148,28 @@ class ResultAggregator:
                 logger.debug(
                     'Encountered an auth-required task: breaking synchronous message/send flow.'
                 )
+                should_interrupt = True
+            # For non-blocking calls, interrupt as soon as a task is available.
+            elif not blocking:
+                logger.debug(
+                    'Non-blocking call: returning task after first event.'
+                )
+                should_interrupt = True
+
+            if should_interrupt:
+                # Continue consuming the rest of the events in the background.
                 # TODO: We should track all outstanding tasks to ensure they eventually complete.
-                asyncio.create_task(self._continue_consuming(event_stream))  # noqa: RUF006
+                asyncio.create_task(  # noqa: RUF006
+                    self._continue_consuming(event_stream, event_callback)
+                )
                 interrupted = True
                 break
         return await self.task_manager.get_task(), interrupted
 
     async def _continue_consuming(
-        self, event_stream: AsyncIterator[Event]
+        self,
+        event_stream: AsyncIterator[Event],
+        event_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Continues processing an event stream in a background task.
 
@@ -146,6 +178,9 @@ class ResultAggregator:
 
         Args:
             event_stream: The remaining `AsyncIterator` of events from the consumer.
+            event_callback: Optional async callback function to be called after each event is processed.
         """
         async for event in event_stream:
             await self.task_manager.process(event)
+            if event_callback:
+                await event_callback()

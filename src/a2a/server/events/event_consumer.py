@@ -62,7 +62,7 @@ class EventConsumer:
                 InternalError(message='Agent did not return any response')
             ) from e
 
-        logger.debug(f'Dequeued event of type: {type(event)} in consume_one.')
+        logger.debug('Dequeued event of type: %s in consume_one.', type(event))
 
         self.queue.task_done()
 
@@ -95,7 +95,7 @@ class EventConsumer:
                     self.queue.dequeue_event(), timeout=self._timeout
                 )
                 logger.debug(
-                    f'Dequeued event of type: {type(event)} in consume_all.'
+                    'Dequeued event of type: %s in consume_all.', type(event)
                 )
                 self.queue.task_done()
                 logger.debug(
@@ -125,7 +125,7 @@ class EventConsumer:
                 # other part is waiting for an event or a closed queue.
                 if is_final_event:
                     logger.debug('Stopping event consumption in consume_all.')
-                    await self.queue.close()
+                    await self.queue.close(True)
                     yield event
                     break
                 yield event
@@ -135,18 +135,16 @@ class EventConsumer:
             except asyncio.TimeoutError:  # pyright: ignore [reportUnusedExcept]
                 # This class was made an alias of build-in TimeoutError after 3.11
                 continue
-            except QueueClosed:
+            except (QueueClosed, asyncio.QueueEmpty):
                 # Confirm that the queue is closed, e.g. we aren't on
                 # python 3.12 and get a queue empty error on an open queue
                 if self.queue.is_closed():
                     break
-            except ValidationError as e:
-                logger.error(f'Invalid event format received: {e}')
+            except ValidationError:
+                logger.exception('Invalid event format received')
                 continue
             except Exception as e:
-                logger.error(
-                    f'Stopping event consumption due to exception: {e}'
-                )
+                logger.exception('Stopping event consumption due to exception')
                 self._exception = e
                 continue
 
@@ -160,5 +158,5 @@ class EventConsumer:
             agent_task: The asyncio.Task that completed.
         """
         logger.debug('Agent task callback triggered.')
-        if agent_task.exception() is not None:
+        if not agent_task.cancelled() and agent_task.done():
             self._exception = agent_task.exception()

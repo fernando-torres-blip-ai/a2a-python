@@ -1,20 +1,39 @@
 import logging
 
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from starlette.applications import Starlette
-from starlette.routing import Route
+
+if TYPE_CHECKING:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    _package_starlette_installed = True
+
+else:
+    try:
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+
+        _package_starlette_installed = True
+    except ImportError:
+        Starlette = Any
+        Route = Any
+
+        _package_starlette_installed = False
 
 from a2a.server.apps.jsonrpc.jsonrpc_app import (
     CallContextBuilder,
     JSONRPCApplication,
 )
+from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers.jsonrpc_handler import RequestHandler
 from a2a.types import AgentCard
 from a2a.utils.constants import (
     AGENT_CARD_WELL_KNOWN_PATH,
     DEFAULT_RPC_URL,
     EXTENDED_AGENT_CARD_PATH,
+    PREV_AGENT_CARD_WELL_KNOWN_PATH,
 )
 
 
@@ -29,12 +48,17 @@ class A2AStarletteApplication(JSONRPCApplication):
     (SSE).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         agent_card: AgentCard,
         http_handler: RequestHandler,
         extended_agent_card: AgentCard | None = None,
         context_builder: CallContextBuilder | None = None,
+        card_modifier: Callable[[AgentCard], AgentCard] | None = None,
+        extended_card_modifier: Callable[
+            [AgentCard, ServerCallContext], AgentCard
+        ]
+        | None = None,
     ) -> None:
         """Initializes the A2AStarletteApplication.
 
@@ -47,12 +71,25 @@ class A2AStarletteApplication(JSONRPCApplication):
             context_builder: The CallContextBuilder used to construct the
               ServerCallContext passed to the http_handler. If None, no
               ServerCallContext is passed.
+            card_modifier: An optional callback to dynamically modify the public
+              agent card before it is served.
+            extended_card_modifier: An optional callback to dynamically modify
+              the extended agent card before it is served. It receives the
+              call context.
         """
+        if not _package_starlette_installed:
+            raise ImportError(
+                'Packages `starlette` and `sse-starlette` are required to use the'
+                ' `A2AStarletteApplication`. It can be added as a part of `a2a-sdk`'
+                ' optional dependencies, `a2a-sdk[http-server]`.'
+            )
         super().__init__(
             agent_card=agent_card,
             http_handler=http_handler,
             extended_agent_card=extended_agent_card,
             context_builder=context_builder,
+            card_modifier=card_modifier,
+            extended_card_modifier=extended_card_modifier,
         )
 
     def routes(
@@ -86,7 +123,20 @@ class A2AStarletteApplication(JSONRPCApplication):
             ),
         ]
 
-        if self.agent_card.supportsAuthenticatedExtendedCard:
+        if agent_card_url == AGENT_CARD_WELL_KNOWN_PATH:
+            # For backward compatibility, serve the agent card at the deprecated path as well.
+            # TODO: remove in a future release
+            app_routes.append(
+                Route(
+                    PREV_AGENT_CARD_WELL_KNOWN_PATH,
+                    self._handle_get_agent_card,
+                    methods=['GET'],
+                    name='deprecated_agent_card',
+                )
+            )
+
+        # TODO: deprecated endpoint to be removed in a future release
+        if self.agent_card.supports_authenticated_extended_card:
             app_routes.append(
                 Route(
                     extended_agent_card_url,
